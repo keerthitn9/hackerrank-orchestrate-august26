@@ -169,6 +169,36 @@ def build_indexes(tables: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
     idx["image_by_id"] = to_index(tables["images"], "image_id")
     idx["voice_by_id"] = to_index(tables["voice_notes"], "voice_note_id")
 
+    # --- Personalization indexes (new) ---
+    history_by_sender: Dict[Any, List[dict]] = {}
+    history_by_business: Dict[Any, List[dict]] = {}
+    history_by_group: Dict[Any, List[dict]] = {}
+    mh = tables["message_history"]
+    if not mh.empty:
+        for _, row in mh.iterrows():
+            r = row.to_dict()
+            uid = r.get("user_id")
+            sid = r.get("sender_user_id")
+            bid = r.get("business_id")
+            gid = r.get("group_id")
+            if uid is not None and sid is not None and pd.notna(sid):
+                history_by_sender.setdefault((uid, sid), []).append(r)
+            if uid is not None and bid is not None and pd.notna(bid):
+                history_by_business.setdefault((uid, bid), []).append(r)
+            if uid is not None and gid is not None and pd.notna(gid):
+                history_by_group.setdefault((uid, gid), []).append(r)
+    idx["history_by_user_sender"] = history_by_sender
+    idx["history_by_user_business"] = history_by_business
+    idx["history_by_user_group"] = history_by_group
+
+    event_by_user_message: Dict[Any, dict] = {}
+    me2 = tables["message_events"]
+    if not me2.empty:
+        for _, row in me2.iterrows():
+            r = row.to_dict()
+            event_by_user_message[(r.get("user_id"), r.get("message_id"))] = r
+    idx["event_by_user_message"] = event_by_user_message
+
     return idx
 
 
@@ -508,34 +538,162 @@ class PersonalizationResult:
     engagement_score: float
     history_sample_size: int
     opted_out_flag: bool
+    evidence_candidates: List[dict] = field(default_factory=list)
+    # each candidate: {"message_id", "opened", "replied", "dismissed",
+    #                  "muted", "reported", "created_at", "match_type"}
 
+def _row_get(row: dict, key: str, default=None):
+    """Null-safe helper for reading a value out of a history/event dict row."""
+    if not row:
+        return default
+    val = row.get(key, default)
+    try:
+        if pd.isna(val):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return val
 
-def evaluate_personalization(ctx: MessageContext) -> PersonalizationResult:
+def evaluate_personalization(ctx: MessageContext, idx: Dict[str, Any]) -> PersonalizationResult:
     """
-    PLACEHOLDER for the full personalization engine.
+    Personalization engine with weighted match sources.
 
-    v1 behaviour: returns a neutral result (no bias toward notify or mute)
-    unless a clear opt-out is recorded in business history, which is cheap
-    and reliable to check even in this minimal version.
+    Sender and business matches always count at full weight. Group matches
+    are weighted down as group size grows. Thresholds are derived from the
+    actual member_count distribution across groups.csv (natural gaps at
+    ~50 and ~100 members separate small-community, mid-size, and
+    broadcast-scale groups):
 
-    TODO (future work):
-        - compute opened/replied/dismissed/muted/reported rates from
-          ctx.sender_history_events filtered to this sender/business/group
-        - weight by history_sample_size (sparse history should not dominate)
-        - feed engagement_score into the Decision Engine's fatigue/engaged
-          rules
+        member_count < 50   -> weight 1.0
+        member_count < 100  -> weight 0.5
+        member_count >= 100 -> weight 0.0 (excluded from scoring and evidence)
+
+    Sparse history (fewer than 2 matched prior messages) is still reported,
+    but flagged via history_sample_size so the Decision Engine won't let a
+    single data point drive a routing decision.
     """
+    user_id = ctx.user_id
+
+    # Determine group weight once for this message's group (if any).
+    group_weight = 1.0
+    if ctx.group_id and ctx.group_row:
+        member_count = _row_get(ctx.group_row, "member_count", 0) or 0
+        try:
+            member_count = int(member_count)
+        except (TypeError, ValueError):
+            member_count = 0
+        if member_count >= 100:
+            group_weight = 0.0
+        elif member_count >= 50:
+            group_weight = 0.5
+        # else stays 1.0
+
+    # O(1) bucket lookups, tagged with match_type before merging.
+    tagged_rows: List[tuple] = []
+    if ctx.sender_user_id:
+        for r in idx["history_by_user_sender"].get((user_id, ctx.sender_user_id), []):
+            tagged_rows.append((r, "sender", 1.0))
+    if ctx.business_id:
+        for r in idx["history_by_user_business"].get((user_id, ctx.business_id), []):
+            tagged_rows.append((r, "business", 1.0))
+    if ctx.group_id and group_weight > 0.0:
+        for r in idx["history_by_user_group"].get((user_id, ctx.group_id), []):
+            tagged_rows.append((r, "group", group_weight))
+
+    # De-duplicate by message_id, preferring the highest-priority match_type
+    # if the same message matched more than one bucket -- sender > business > group.
+    priority = {"sender": 0, "business": 1, "group": 2}
+    best_by_id: Dict[Any, tuple] = {}
+    for r, match_type, weight in tagged_rows:
+        mid = _row_get(r, "message_id")
+        if not mid:
+            continue
+        if mid not in best_by_id or priority[match_type] < priority[best_by_id[mid][1]]:
+            best_by_id[mid] = (r, match_type, weight)
+
+    matched_history = list(best_by_id.values())
+
+    # Opt-out check (unchanged, O(1)).
     opted_out = False
     if ctx.business_history_row is not None:
-        opt_out_val = ctx.business_history_row.get("promotions_opted_out_at")
-        opted_out = isinstance(opt_out_val, str) and opt_out_val.strip() != "" and not pd.isna(opt_out_val)
+        opt_out_val = _row_get(ctx.business_history_row, "promotions_opted_out_at")
+        opted_out = isinstance(opt_out_val, str) and opt_out_val.strip() != ""
+
+    history_sample_size = len(matched_history)  # unweighted count, drives the sparse-history gate
+    if history_sample_size == 0:
+        return PersonalizationResult(
+            engagement_score=0.0,
+            history_sample_size=0,
+            opted_out_flag=opted_out,
+            evidence_candidates=[],
+        )
+
+    weighted_total = 0.0
+    opened = replied = dismissed = muted = reported = 0.0
+    candidates: List[dict] = []
+
+    for h_row, match_type, weight in matched_history:
+        mid = _row_get(h_row, "message_id")
+        event = idx["event_by_user_message"].get((user_id, mid), {})
+
+        is_opened = int(_row_get(event, "message_opened", 0) or 0)
+        is_replied = int(_row_get(event, "message_replied", 0) or 0)
+        is_dismissed = int(_row_get(event, "notification_dismissed", 0) or 0)
+        is_muted = int(_row_get(event, "muted_after_message", 0) or 0)
+        is_reported = int(_row_get(event, "message_reported", 0) or 0)
+
+        opened += is_opened * weight
+        replied += is_replied * weight
+        dismissed += is_dismissed * weight
+        muted += is_muted * weight
+        reported += is_reported * weight
+        weighted_total += weight
+
+        candidates.append({
+            "message_id": mid,
+            "opened": is_opened,
+            "replied": is_replied,
+            "dismissed": is_dismissed,
+            "muted": is_muted,
+            "reported": is_reported,
+            "created_at": _row_get(h_row, "created_at", ""),
+            "match_type": match_type,
+        })
+
+    if weighted_total <= 0.0:
+        # All matches were group-only in a broadcast-scale group and got zeroed out.
+        return PersonalizationResult(
+            engagement_score=0.0,
+            history_sample_size=history_sample_size,
+            opted_out_flag=opted_out,
+            evidence_candidates=[],
+        )
+
+    opened_pct = opened / weighted_total
+    replied_pct = replied / weighted_total
+    dismissed_pct = dismissed / weighted_total
+    muted_pct = muted / weighted_total
+    reported_pct = reported / weighted_total
+
+    raw_score = (
+        opened_pct * 0.3
+        + replied_pct * 0.4
+        - dismissed_pct * 0.3
+        - muted_pct * 0.5
+        - reported_pct * 1.0
+    )
+    engagement_score = max(-1.0, min(1.0, raw_score))
+
+    match_priority = {"sender": 0, "business": 1, "group": 2}
+    candidates.sort(key=lambda c: str(c["created_at"]), reverse=True)
+    candidates.sort(key=lambda c: match_priority.get(c["match_type"], 3))
 
     return PersonalizationResult(
-        engagement_score=0.0,
-        history_sample_size=0,
+        engagement_score=engagement_score,
+        history_sample_size=history_sample_size,
         opted_out_flag=opted_out,
+        evidence_candidates=candidates,
     )
-
 
 # ---------------------------------------------------------------------------
 # Business Trust Engine (lightweight, obvious-only version)
@@ -571,34 +729,53 @@ def evaluate_business_trust(ctx: MessageContext) -> Optional[TrustResult]:
 # Placeholder: Evidence Selection
 # ---------------------------------------------------------------------------
 
-def select_evidence(ctx: MessageContext, decision_action: str) -> str:
+def select_evidence(personalization: PersonalizationResult, decision_action: str) -> str:
     """
-    PLACEHOLDER for evidence selection.
+    Real evidence selector.
 
-    v1 behaviour: always returns "none", since the personalization engine is
-    also a placeholder and has no real history matching yet. This keeps the
-    output schema valid and truthful (no fabricated evidence) while the real
-    retrieval logic is built out.
+    Filters personalization's evidence_candidates to those consistent with the
+    final decision's direction, then returns up to 3 message_ids (already
+    ranked sender > business > group, then recency, by evaluate_personalization).
 
-    TODO (future work):
-        - filter ctx.sender_history_events to rows consistent with
-          decision_action (opened/replied for notify/digest,
-          dismissed/muted/reported for mute)
-        - rank by sender > business > group match, then recency
-        - return up to 3 message_ids joined with ';'
+    - notify / digest -> cite candidates that were opened or replied to
+    - mute             -> cite candidates that were dismissed, muted, or reported
+
+    Returns "none" if there is no consistent supporting evidence, rather than
+    fabricating or citing contradictory history.
     """
-    return "none"
+    if not personalization.evidence_candidates:
+        return "none"
+
+    if decision_action in ("notify", "digest"):
+        relevant = [c for c in personalization.evidence_candidates if c["opened"] or c["replied"]]
+    elif decision_action == "mute":
+        relevant = [
+            c for c in personalization.evidence_candidates
+            if c["dismissed"] or c["muted"] or c["reported"]
+        ]
+    else:
+        relevant = []
+
+    if not relevant:
+        return "none"
+
+    top = relevant[:3]
+    return ";".join(str(c["message_id"]) for c in top)
 
 
 # ---------------------------------------------------------------------------
 # Message type inference (shared helper, used by every rule)
 # ---------------------------------------------------------------------------
 
-def infer_type(ctx: MessageContext, effective_text: str) -> str:
+def infer_type(ctx: MessageContext, effective_text: str, action: str = "digest") -> str:
     """
     Shared, best-effort message_type classifier used by every non-safety
-    routing rule, so type inference logic never gets duplicated or hardcoded
-    per rule.
+    routing rule.
+
+    `action` is now required so that the "urgent" label is only ever applied
+    when the message was actually routed to notify -- otherwise a message
+    could be typed "urgent" while simultaneously being sent to digest/mute,
+    which is a contradictory, self-defeating output.
     """
     norm = normalize_text(effective_text)
 
@@ -613,8 +790,11 @@ def infer_type(ctx: MessageContext, effective_text: str) -> str:
         return "greeting"
     if ctx.forwarded_count >= FORWARDED_HIGH_THRESHOLD:
         return "forward"
-    if DEADLINE_PATTERN.search(norm) or mentions_user(effective_text, ctx.user_id):
+
+    # Only label as "urgent" if the decision actually was to notify.
+    if action == "notify" and (DEADLINE_PATTERN.search(norm) or mentions_user(effective_text, ctx.user_id)):
         return "urgent"
+
     if contains_any(norm, ["meeting", "reminder", "schedule", "event", "closes"]):
         return "event"
     if ctx.conversation_type == "personal":
@@ -645,13 +825,9 @@ def decide(
 ) -> DecisionResult:
     """
     Ordered deterministic cascade. First applicable branch wins.
-    Only implements the "obvious" tiers requested for this version:
-        1. Safety (scam/spam)
-        2. Obvious urgency -> notify
-        3. Obvious opt-out -> mute
-        4. Sensible defaults (personal vs group/business) -> digest
+    Safety always runs first and is never overridden by personalization.
     """
-    # 1. Safety gate
+    # 1. Safety gate (unchanged, always first, never bypassed)
     if safety is not None:
         return DecisionResult(
             action=safety.action,
@@ -660,12 +836,20 @@ def decide(
             confidence=safety.confidence,
         )
 
-    # 2. Obvious opt-out (cheap, reliable personalization signal even in v1)
-    if personalization.opted_out_flag:
+    # 2. Opt-out OR strong negative engagement with enough history to trust it.
+    strong_negative_engagement = (
+        personalization.history_sample_size >= 2 and personalization.engagement_score <= -0.4
+    )
+    if personalization.opted_out_flag or strong_negative_engagement:
+        reason = (
+            "User has opted out of promotional messages from this business."
+            if personalization.opted_out_flag
+            else "User has consistently dismissed or muted similar messages from this sender/business/group."
+        )
         return DecisionResult(
             action="mute",
-            message_type=infer_type(ctx, effective_text),
-            reason="User has opted out of promotional messages from this business.",
+            message_type=infer_type(ctx, effective_text, action="mute"),
+            reason=reason,
             confidence=0.82,
         )
 
@@ -674,7 +858,7 @@ def decide(
         top_signal = urgency.signals[0] if urgency.signals else "urgency signals"
         return DecisionResult(
             action="notify",
-            message_type=infer_type(ctx, effective_text),
+            message_type=infer_type(ctx, effective_text, action="notify"),
             reason=f"Message shows strong urgency signals ({top_signal}).",
             confidence=0.85,
         )
@@ -683,7 +867,7 @@ def decide(
     if trust is not None and trust.label == "trusted" and urgency.score >= 0.25:
         return DecisionResult(
             action="notify",
-            message_type=infer_type(ctx, effective_text),
+            message_type=infer_type(ctx, effective_text, action="notify"),
             reason="Verified business update relevant to the user.",
             confidence=0.75,
         )
@@ -697,43 +881,47 @@ def decide(
             confidence=0.78,
         )
 
-    # 6. Sensible default
+    # 5b. Positive engagement with enough history -> digest
+    if personalization.history_sample_size >= 2 and personalization.engagement_score >= 0.3:
+        return DecisionResult(
+            action="digest",
+            message_type=infer_type(ctx, effective_text, action="digest"),
+            reason="User typically engages with messages like this; not urgent enough to interrupt.",
+            confidence=0.72,
+        )
+
+    # 6. Sensible default (unchanged)
     if ctx.conversation_type == "personal":
         return DecisionResult(
             action="digest",
-            message_type=infer_type(ctx, effective_text),
+            message_type=infer_type(ctx, effective_text, action="digest"),
             reason="No strong urgency or risk signal; personal message defaulted to digest.",
             confidence=0.6,
         )
 
     return DecisionResult(
         action="digest",
-        message_type=infer_type(ctx, effective_text),
+        message_type=infer_type(ctx, effective_text, action="digest"),
         reason="No strong signal either way; defaulting to digest based on conversation context.",
         confidence=0.6,
     )
-
 
 # ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
 def route_message(row: pd.Series, idx: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Runs the full pipeline for a single message row and returns a dict ready
-    to write to output.csv.
-    """
     ctx = build_context(row, idx)
     ctx.media_extracted_text = extract_media_text(ctx, idx)
     effective_text = get_effective_text(ctx)
 
     safety = evaluate_safety(ctx, effective_text)
     urgency = evaluate_urgency(ctx, effective_text)
-    personalization = evaluate_personalization(ctx)
+    personalization = evaluate_personalization(ctx, idx)          # <-- now takes idx
     trust = evaluate_business_trust(ctx)
 
     decision = decide(ctx, effective_text, safety, urgency, personalization, trust)
-    evidence = select_evidence(ctx, decision.action)
+    evidence = select_evidence(personalization, decision.action)  # <-- new signature
 
     return {
         "message_id": ctx.message_id,
