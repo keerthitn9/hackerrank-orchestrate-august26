@@ -83,6 +83,9 @@ CASUAL_CHAT_WORDS = [
     "no rush", "no pressure", "no urgency", "nothing urgent", "whenever",
     "call me", "can you check", "just checking", "let me know", "koi urgency nahi",
 ]
+ADVISORY_DISCLAIMER_WORDS = [
+    "never ask", "we will never", "do not share", "don't share", "will not ask",
+]
 
 # Prompt-injection phrases: checked against RAW, unnormalized text.
 # These are messages attempting to instruct the router itself, not the user.
@@ -387,8 +390,17 @@ def normalize_text(text: str) -> str:
 
 
 def contains_any(text: str, keywords: List[str]) -> bool:
-    """True if any keyword/phrase appears as a substring in text (case handled by caller)."""
-    return any(kw in text for kw in keywords)
+    """
+    True if any keyword/phrase appears in text as a whole word/phrase match,
+    not as a substring of a larger word (e.g. "pin" must not match inside
+    "ping"). Multi-word phrases are matched as-is via regex escaping; single
+    words get \\b word-boundary anchors.
+    """
+    for kw in keywords:
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        if re.search(pattern, text):
+            return True
+    return False
 
 
 def domain_mismatch(business_row: Optional[dict]) -> Optional[bool]:
@@ -446,92 +458,52 @@ def detect_injection(raw_text: str) -> bool:
 
 
 def evaluate_safety(ctx: MessageContext, effective_text: str) -> Optional[SafetyResult]:
-    """
-    Core deterministic safety rules. Ordered, first match wins.
-    """
     norm = normalize_text(effective_text)
 
-    # Rule 1: prompt injection (checked on RAW text, highest priority safety trap)
     if detect_injection(ctx.raw_message_text):
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:injection",
-            reason="Message attempts to override routing instructions; muted for safety.",
-            confidence=0.93,
-        )
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:injection",
+                             reason="Message attempts to override routing instructions; muted for safety.",
+                             confidence=0.93)
 
-    # Rule 2: OTP / PIN / password request
-    if contains_any(norm, OTP_PIN_PASSWORD_WORDS):
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:credential_request",
-            reason="Message requests OTP, PIN, or password verification; muted for safety.",
-            confidence=0.9,
-        )
+    # OTP/PIN/password request -- but skip if this is an anti-phishing
+    # disclaimer ("we never ask for your OTP") rather than an actual request.
+    if contains_any(norm, OTP_PIN_PASSWORD_WORDS) and not contains_any(norm, ADVISORY_DISCLAIMER_WORDS):
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:credential_request",
+                             reason="Message requests OTP, PIN, or password verification; muted for safety.",
+                             confidence=0.9)
 
-    # Rule 3: spoofed / mismatched business domain
+    # Domain mismatch: only a hard Safety mute for UNVERIFIED businesses.
+    # A verified business with a mismatched marketing/shortlink domain is
+    # downgraded to "suspicious" trust later in the cascade instead of an
+    # outright scam mute, since verified + mismatch is common for legitimate
+    # tracking links and shouldn't be treated identically to a spoofed bank.
     mismatch = domain_mismatch(ctx.business_row)
-    if mismatch is True:
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:domain_mismatch",
-            reason="Sender domain does not match the business's official domain.",
-            confidence=0.9,
-        )
+    if mismatch is True and not is_verified(ctx.business_row):
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:domain_mismatch",
+                             reason="Sender domain does not match the business's official domain.",
+                             confidence=0.9)
     if mismatch is None and ctx.business_row is not None and not is_verified(ctx.business_row):
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:missing_domain",
-            reason="Unverified business with no listed official domain; treated as high risk.",
-            confidence=0.85,
-        )
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:missing_domain",
+                             reason="Unverified business with no listed official domain; treated as high risk.",
+                             confidence=0.85)
 
-    # Rule 4: suspicious/shortened link
     if SHORTENED_URL_PATTERN.search(norm):
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:suspicious_link",
-            reason="Message contains a shortened or suspicious link.",
-            confidence=0.85,
-        )
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:suspicious_link",
+                             reason="Message contains a shortened or suspicious link.", confidence=0.85)
 
-    # NEW Rule 5: account-takeover pressure (no OTP/PIN word literally present,
-    # but classic "your account is blocked, verify/login now" scam pattern),
-    # combined with urgency language to avoid false-positives on legitimate
-    # "your account statement is ready" style business updates.
     if contains_any(norm, ACCOUNT_TAKEOVER_WORDS) and contains_any(norm, URGENCY_WORDS):
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:account_takeover_pressure",
-            reason="Message pressures account verification/login under urgency; muted for safety.",
-            confidence=0.87,
-        )
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:account_takeover_pressure",
+                             reason="Message pressures account verification/login under urgency; muted for safety.",
+                             confidence=0.87)
 
-    # Rule 6 (was 5): immediate payment demand
     if contains_any(norm, PAYMENT_ACTION_WORDS) and contains_any(norm, URGENCY_WORDS):
-        return SafetyResult(
-            action="mute",
-            message_type="scam",
-            rule_id="safety:payment_fraud",
-            reason="Message demands urgent payment or QR scan; muted for safety.",
-            confidence=0.87,
-        )
+        return SafetyResult(action="mute", message_type="scam", rule_id="safety:payment_fraud",
+                             reason="Message demands urgent payment or QR scan; muted for safety.", confidence=0.87)
 
-    # Rule 7 (was 6): high forwarded-count chain/blessing spam
     if ctx.forwarded_count >= FORWARDED_HIGH_THRESHOLD and contains_any(norm, CHAIN_PHRASES):
-        return SafetyResult(
-            action="mute",
-            message_type="spam",
-            rule_id="safety:chain_forward",
-            reason=f"Repeated chain-forward pattern (forwarded {ctx.forwarded_count} times).",
-            confidence=0.85,
-        )
+        return SafetyResult(action="mute", message_type="spam", rule_id="safety:chain_forward",
+                             reason=f"Repeated chain-forward pattern (forwarded {ctx.forwarded_count} times).",
+                             confidence=0.85)
 
     return None
 
