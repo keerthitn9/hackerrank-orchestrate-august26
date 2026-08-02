@@ -79,6 +79,11 @@ SPAM_INDICATOR_WORDS = [
     "voucher expires", "winner", "lucky draw", "limited window",
     "limited time offer", "reward is waiting", "selected for reward",
 ]
+CASUAL_CHAT_WORDS = [
+    "no rush", "no pressure", "no urgency", "nothing urgent", "whenever",
+    "call me", "can you check", "just checking", "let me know", "koi urgency nahi",
+]
+
 # Prompt-injection phrases: checked against RAW, unnormalized text.
 # These are messages attempting to instruct the router itself, not the user.
 INJECTION_PHRASES = [
@@ -819,11 +824,6 @@ def infer_type(ctx: MessageContext, effective_text: str, action: str = "digest")
     """
     Shared, best-effort message_type classifier used by every non-safety
     routing rule.
-
-    Expanded fallback coverage: checks promotion and forward-style language
-    even for non-business, non-high-forward-count messages before giving up
-    and returning "unknown" -- this was previously the most common silent
-    catch-all in the output.
     """
     norm = normalize_text(effective_text)
 
@@ -845,18 +845,20 @@ def infer_type(ctx: MessageContext, effective_text: str, action: str = "digest")
     if contains_any(norm, ["meeting", "reminder", "schedule", "event", "closes"]):
         return "event"
 
-    # NEW: catch promotional/selling language even in group/personal messages
-    # with low forward counts (e.g. "selling", "pickup", "price final", "DM if interested").
     if contains_any(norm, ["selling", "for sale", "price final", "dm if interested", "pickup near"]):
         return "promotion"
 
-    # NEW: catch forward-style content even below the high forward-count
-    # threshold (e.g. "fwd as received", "sharing here", "forward to").
     if contains_any(norm, ["fwd as received", "sharing here", "forward to", "share this", "forwarded:"]):
         return "forward"
 
     if ctx.conversation_type == "personal":
         return "personal" if norm.strip() else "unknown"
+
+    # NEW: casual/conversational content in a group chat that isn't promo,
+    # event, forward, or business -- still meaningfully "personal" in tone,
+    # just happening inside a group.
+    if norm.strip() and contains_any(norm, CASUAL_CHAT_WORDS):
+        return "personal"
 
     return "unknown"
 
