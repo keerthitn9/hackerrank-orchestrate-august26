@@ -208,8 +208,14 @@ def build_indexes(tables: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
             event_by_user_message[(r.get("user_id"), r.get("message_id"))] = r
     idx["event_by_user_message"] = event_by_user_message
 
-    return idx
+    daily_by_user: Dict[Any, List[dict]] = {}
+    dns = tables["daily_notification_summary"]
+    if not dns.empty:
+        for user_id, group_df in dns.sort_values("date").groupby("user_id"):
+            daily_by_user[user_id] = group_df.tail(7).to_dict("records")
+    idx["daily_summary_by_user"] = daily_by_user
 
+    return idx
 
 # ---------------------------------------------------------------------------
 # Context object
@@ -242,6 +248,23 @@ class MessageContext:
     sender_history_events: List[dict] = field(default_factory=list)
 
     media_extracted_text: Optional[str] = None  # filled by multimodal placeholder
+
+def is_fatigued(ctx: MessageContext, idx: Dict[str, Any]) -> bool:
+    """
+    Checks the last 7 days of notification volume for this user. High
+    dismiss-to-sent ratio over that window suggests the user is currently
+    overwhelmed, which should slightly lower confidence in a notify decision
+    and slightly raise confidence in a mute/digest decision -- it never
+    gates the action itself, only nudges confidence.
+    """
+    recent = idx.get("daily_summary_by_user", {}).get(ctx.user_id, [])
+    if not recent:
+        return False
+    sent = sum(int(r.get("notifications_sent", 0) or 0) for r in recent)
+    dismissed = sum(int(r.get("notifications_dismissed", 0) or 0) for r in recent)
+    if sent == 0:
+        return False
+    return (dismissed / sent) > 0.4
 
 
 def safe_get(d: Optional[dict], key: str, default=None):
@@ -858,17 +881,17 @@ def decide(
     urgency: UrgencyResult,
     personalization: PersonalizationResult,
     trust: Optional[TrustResult],
+    idx: Dict[str, Any],
 ) -> DecisionResult:
     """Ordered deterministic cascade. First applicable branch wins."""
 
     if safety is not None:
         return DecisionResult(
-            action=safety.action,
-            message_type=safety.message_type,
-            reason=safety.reason,
-            confidence=safety.confidence,
-            rule_id=safety.rule_id,
+            action=safety.action, message_type=safety.message_type,
+            reason=safety.reason, confidence=safety.confidence, rule_id=safety.rule_id,
         )
+
+    fatigued = is_fatigued(ctx, idx)
 
     strong_negative_engagement = (
         personalization.history_sample_size >= 2 and personalization.engagement_score <= -0.4
@@ -879,80 +902,66 @@ def decide(
             if personalization.opted_out_flag
             else "User has consistently dismissed or muted similar messages from this sender/business/group."
         )
-        # Confidence bonus: more matched history = more trust in the pattern, capped at band ceiling (0.89).
         bonus = min(0.07, 0.02 * max(0, personalization.history_sample_size - 2))
+        if fatigued:
+            bonus += 0.02  # fatigued user + negative history reinforce each other
         return DecisionResult(
-            action="mute",
-            message_type=infer_type(ctx, effective_text, action="mute"),
-            reason=reason,
-            confidence=round(min(0.89, 0.82 + bonus), 2),
-            rule_id="personalization_fatigue",
+            action="mute", message_type=infer_type(ctx, effective_text, action="mute"),
+            reason=reason, confidence=round(min(0.89, 0.82 + bonus), 2), rule_id="personalization_fatigue",
         )
 
     if urgency.score >= 0.55:
         top_signal = urgency.signals[0] if urgency.signals else "urgency signals"
         return DecisionResult(
-            action="notify",
-            message_type=infer_type(ctx, effective_text, action="notify"),
+            action="notify", message_type=infer_type(ctx, effective_text, action="notify"),
             reason=f"Message shows strong urgency signals ({top_signal}).",
-            confidence=0.85,
-            rule_id="urgency_fastpath",
+            confidence=0.85, rule_id="urgency_fastpath",
         )
 
     if trust is not None and trust.label == "trusted" and urgency.score >= 0.25:
         return DecisionResult(
-            action="notify",
-            message_type=infer_type(ctx, effective_text, action="notify"),
+            action="notify", message_type=infer_type(ctx, effective_text, action="notify"),
             reason="Verified business update relevant to the user.",
-            confidence=0.75,
-            rule_id="trusted_business_moderate_urgency",
+            confidence=0.75, rule_id="trusted_business_moderate_urgency",
         )
 
     if trust is not None and trust.label == "suspicious":
         return DecisionResult(
-            action="mute",
-            message_type="spam",
+            action="mute", message_type="spam",
             reason="Sender business shows signs of risk (unverified or high report rate).",
-            confidence=0.78,
-            rule_id="trust_override",
+            confidence=0.78, rule_id="trust_override",
         )
 
     norm = normalize_text(effective_text)
     is_trusted_business = trust is not None and trust.label == "trusted"
     if contains_any(norm, SPAM_INDICATOR_WORDS) and not is_trusted_business:
         return DecisionResult(
-            action="mute",
-            message_type="spam",
+            action="mute", message_type="spam",
             reason="Message uses unsolicited reward/lottery-style language typical of spam.",
-            confidence=0.8,
-            rule_id="spam_heuristic",
+            confidence=0.8, rule_id="spam_heuristic",
         )
 
     if personalization.history_sample_size >= 2 and personalization.engagement_score >= 0.3:
         bonus = min(0.08, 0.02 * max(0, personalization.history_sample_size - 2))
+        if fatigued:
+            bonus -= 0.02  # fatigued user, less confident this specific digest will land well
         return DecisionResult(
-            action="digest",
-            message_type=infer_type(ctx, effective_text, action="digest"),
+            action="digest", message_type=infer_type(ctx, effective_text, action="digest"),
             reason="User typically engages with messages like this; not urgent enough to interrupt.",
-            confidence=round(min(0.8, 0.72 + bonus), 2),
-            rule_id="engaged_default",
+            confidence=round(max(0.7, min(0.8, 0.72 + bonus)), 2), rule_id="engaged_default",
         )
 
     if ctx.conversation_type == "personal":
         return DecisionResult(
-            action="digest",
-            message_type=infer_type(ctx, effective_text, action="digest"),
+            action="digest", message_type=infer_type(ctx, effective_text, action="digest"),
             reason="No strong urgency or risk signal; personal message defaulted to digest.",
-            confidence=0.6,
-            rule_id="personal_default",
+            confidence=0.6, rule_id="personal_default",
         )
 
     return DecisionResult(
-        action="digest",
-        message_type=infer_type(ctx, effective_text, action="digest"),
+        action="digest", message_type=infer_type(ctx, effective_text, action="digest"),
         reason="No strong signal either way; defaulting to digest based on conversation context.",
-        confidence=0.6,
-        rule_id="default_heuristic",
+        confidence=0.6, rule_id="default_heuristic",
     )
 
 # ---------------------------------------------------------------------------
@@ -969,7 +978,7 @@ def route_message(row: pd.Series, idx: Dict[str, Any]) -> Dict[str, Any]:
     personalization = evaluate_personalization(ctx, idx)
     trust = evaluate_business_trust(ctx)
 
-    decision = decide(ctx, effective_text, safety, urgency, personalization, trust)
+    decision = decide(ctx, effective_text, safety, urgency, personalization, trust, idx)
     evidence = select_evidence(personalization, decision.action, decision.rule_id)
 
     return {
