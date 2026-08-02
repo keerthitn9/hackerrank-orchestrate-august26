@@ -69,7 +69,16 @@ DEADLINE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 MENTION_PATTERN = re.compile(r"@(\w+)")
-
+ACCOUNT_TAKEOVER_WORDS = [
+    "account blocked", "account will be blocked", "login now", "complete verification",
+    "verify now", "verification pending", "profile will be restricted",
+    "account will be restricted", "confirm your account", "reactivate your account",
+]
+SPAM_INDICATOR_WORDS = [
+    "congrats", "you have been selected", "claim your reward", "claim today",
+    "voucher expires", "winner", "lucky draw", "limited window",
+    "limited time offer", "reward is waiting", "selected for reward",
+]
 # Prompt-injection phrases: checked against RAW, unnormalized text.
 # These are messages attempting to instruct the router itself, not the user.
 INJECTION_PHRASES = [
@@ -322,11 +331,20 @@ def extract_media_text(ctx: MessageContext, idx: Dict[str, Any]) -> str:
 
 def get_effective_text(ctx: MessageContext) -> str:
     """
-    Returns the text the rest of the pipeline should reason over: the raw
-    message text, or extracted media text for image/voice messages.
+    Returns the text the rest of the pipeline should reason over.
+
+    For image/voice messages, prefers real OCR/ASR-extracted text when
+    available. If extraction is empty (OCR/ASR not yet implemented, or it
+    genuinely failed), falls back to raw_message_text -- most image messages
+    in this dataset carry a full text caption alongside the media, and that
+    caption should not be discarded just because the media itself wasn't
+    processed.
     """
     if ctx.media_type in ("image", "voice"):
-        return ctx.media_extracted_text or ""
+        extracted = ctx.media_extracted_text or ""
+        if extracted.strip():
+            return extracted
+        return ctx.raw_message_text or ""
     return ctx.raw_message_text or ""
 
 
@@ -402,12 +420,6 @@ def detect_injection(raw_text: str) -> bool:
 def evaluate_safety(ctx: MessageContext, effective_text: str) -> Optional[SafetyResult]:
     """
     Core deterministic safety rules. Ordered, first match wins.
-    Only implements the "obvious" cases per the current scope:
-        - OTP/PIN/password requests
-        - spoofed/mismatched business domains
-        - prompt injection attempts
-        - high-forward-count chain/blessing spam
-    Returns None if nothing obvious fired (message proceeds to Urgency/Default).
     """
     norm = normalize_text(effective_text)
 
@@ -460,7 +472,20 @@ def evaluate_safety(ctx: MessageContext, effective_text: str) -> Optional[Safety
             confidence=0.85,
         )
 
-    # Rule 5: immediate payment demand (payment word + urgency word together)
+    # NEW Rule 5: account-takeover pressure (no OTP/PIN word literally present,
+    # but classic "your account is blocked, verify/login now" scam pattern),
+    # combined with urgency language to avoid false-positives on legitimate
+    # "your account statement is ready" style business updates.
+    if contains_any(norm, ACCOUNT_TAKEOVER_WORDS) and contains_any(norm, URGENCY_WORDS):
+        return SafetyResult(
+            action="mute",
+            message_type="scam",
+            rule_id="safety:account_takeover_pressure",
+            reason="Message pressures account verification/login under urgency; muted for safety.",
+            confidence=0.87,
+        )
+
+    # Rule 6 (was 5): immediate payment demand
     if contains_any(norm, PAYMENT_ACTION_WORDS) and contains_any(norm, URGENCY_WORDS):
         return SafetyResult(
             action="mute",
@@ -470,7 +495,7 @@ def evaluate_safety(ctx: MessageContext, effective_text: str) -> Optional[Safety
             confidence=0.87,
         )
 
-    # Rule 6: high forwarded-count chain/blessing spam
+    # Rule 7 (was 6): high forwarded-count chain/blessing spam
     if ctx.forwarded_count >= FORWARDED_HIGH_THRESHOLD and contains_any(norm, CHAIN_PHRASES):
         return SafetyResult(
             action="mute",
@@ -729,20 +754,20 @@ def evaluate_business_trust(ctx: MessageContext) -> Optional[TrustResult]:
 # Placeholder: Evidence Selection
 # ---------------------------------------------------------------------------
 
-def select_evidence(personalization: PersonalizationResult, decision_action: str) -> str:
+def select_evidence(personalization: PersonalizationResult, decision_action: str, rule_id: str = "unknown") -> str:
     """
-    Real evidence selector.
-
     Filters personalization's evidence_candidates to those consistent with the
-    final decision's direction, then returns up to 3 message_ids (already
-    ranked sender > business > group, then recency, by evaluate_personalization).
+    final decision's direction, then returns up to 3 message_ids.
 
-    - notify / digest -> cite candidates that were opened or replied to
-    - mute             -> cite candidates that were dismissed, muted, or reported
-
-    Returns "none" if there is no consistent supporting evidence, rather than
-    fabricating or citing contradictory history.
+    Special case: safety:chain_forward reuses real matched history (prior
+    forwards from the same sender/group) instead of forcing "none", since
+    that evidence genuinely exists and supports the decision. All other
+    safety:* rules keep returning "none" -- a hard scam/injection block
+    doesn't need historical justification.
     """
+    if rule_id.startswith("safety:") and rule_id != "safety:chain_forward":
+        return "none"
+
     if not personalization.evidence_candidates:
         return "none"
 
@@ -772,10 +797,10 @@ def infer_type(ctx: MessageContext, effective_text: str, action: str = "digest")
     Shared, best-effort message_type classifier used by every non-safety
     routing rule.
 
-    `action` is now required so that the "urgent" label is only ever applied
-    when the message was actually routed to notify -- otherwise a message
-    could be typed "urgent" while simultaneously being sent to digest/mute,
-    which is a contradictory, self-defeating output.
+    Expanded fallback coverage: checks promotion and forward-style language
+    even for non-business, non-high-forward-count messages before giving up
+    and returning "unknown" -- this was previously the most common silent
+    catch-all in the output.
     """
     norm = normalize_text(effective_text)
 
@@ -791,12 +816,22 @@ def infer_type(ctx: MessageContext, effective_text: str, action: str = "digest")
     if ctx.forwarded_count >= FORWARDED_HIGH_THRESHOLD:
         return "forward"
 
-    # Only label as "urgent" if the decision actually was to notify.
     if action == "notify" and (DEADLINE_PATTERN.search(norm) or mentions_user(effective_text, ctx.user_id)):
         return "urgent"
 
     if contains_any(norm, ["meeting", "reminder", "schedule", "event", "closes"]):
         return "event"
+
+    # NEW: catch promotional/selling language even in group/personal messages
+    # with low forward counts (e.g. "selling", "pickup", "price final", "DM if interested").
+    if contains_any(norm, ["selling", "for sale", "price final", "dm if interested", "pickup near"]):
+        return "promotion"
+
+    # NEW: catch forward-style content even below the high forward-count
+    # threshold (e.g. "fwd as received", "sharing here", "forward to").
+    if contains_any(norm, ["fwd as received", "sharing here", "forward to", "share this", "forwarded:"]):
+        return "forward"
+
     if ctx.conversation_type == "personal":
         return "personal" if norm.strip() else "unknown"
 
@@ -813,6 +848,7 @@ class DecisionResult:
     message_type: str
     reason: str
     confidence: float
+    rule_id: str = "unknown"
 
 
 def decide(
@@ -823,20 +859,17 @@ def decide(
     personalization: PersonalizationResult,
     trust: Optional[TrustResult],
 ) -> DecisionResult:
-    """
-    Ordered deterministic cascade. First applicable branch wins.
-    Safety always runs first and is never overridden by personalization.
-    """
-    # 1. Safety gate (unchanged, always first, never bypassed)
+    """Ordered deterministic cascade. First applicable branch wins."""
+
     if safety is not None:
         return DecisionResult(
             action=safety.action,
             message_type=safety.message_type,
             reason=safety.reason,
             confidence=safety.confidence,
+            rule_id=safety.rule_id,
         )
 
-    # 2. Opt-out OR strong negative engagement with enough history to trust it.
     strong_negative_engagement = (
         personalization.history_sample_size >= 2 and personalization.engagement_score <= -0.4
     )
@@ -846,14 +879,16 @@ def decide(
             if personalization.opted_out_flag
             else "User has consistently dismissed or muted similar messages from this sender/business/group."
         )
+        # Confidence bonus: more matched history = more trust in the pattern, capped at band ceiling (0.89).
+        bonus = min(0.07, 0.02 * max(0, personalization.history_sample_size - 2))
         return DecisionResult(
             action="mute",
             message_type=infer_type(ctx, effective_text, action="mute"),
             reason=reason,
-            confidence=0.82,
+            confidence=round(min(0.89, 0.82 + bonus), 2),
+            rule_id="personalization_fatigue",
         )
 
-    # 3. Obvious urgency -> notify
     if urgency.score >= 0.55:
         top_signal = urgency.signals[0] if urgency.signals else "urgency signals"
         return DecisionResult(
@@ -861,42 +896,55 @@ def decide(
             message_type=infer_type(ctx, effective_text, action="notify"),
             reason=f"Message shows strong urgency signals ({top_signal}).",
             confidence=0.85,
+            rule_id="urgency_fastpath",
         )
 
-    # 4. Trusted business with mild urgency -> notify
     if trust is not None and trust.label == "trusted" and urgency.score >= 0.25:
         return DecisionResult(
             action="notify",
             message_type=infer_type(ctx, effective_text, action="notify"),
             reason="Verified business update relevant to the user.",
             confidence=0.75,
+            rule_id="trusted_business_moderate_urgency",
         )
 
-    # 5. Suspicious business (not caught by hard Safety rules) -> mute
     if trust is not None and trust.label == "suspicious":
         return DecisionResult(
             action="mute",
             message_type="spam",
             reason="Sender business shows signs of risk (unverified or high report rate).",
             confidence=0.78,
+            rule_id="trust_override",
         )
 
-    # 5b. Positive engagement with enough history -> digest
+    norm = normalize_text(effective_text)
+    is_trusted_business = trust is not None and trust.label == "trusted"
+    if contains_any(norm, SPAM_INDICATOR_WORDS) and not is_trusted_business:
+        return DecisionResult(
+            action="mute",
+            message_type="spam",
+            reason="Message uses unsolicited reward/lottery-style language typical of spam.",
+            confidence=0.8,
+            rule_id="spam_heuristic",
+        )
+
     if personalization.history_sample_size >= 2 and personalization.engagement_score >= 0.3:
+        bonus = min(0.08, 0.02 * max(0, personalization.history_sample_size - 2))
         return DecisionResult(
             action="digest",
             message_type=infer_type(ctx, effective_text, action="digest"),
             reason="User typically engages with messages like this; not urgent enough to interrupt.",
-            confidence=0.72,
+            confidence=round(min(0.8, 0.72 + bonus), 2),
+            rule_id="engaged_default",
         )
 
-    # 6. Sensible default (unchanged)
     if ctx.conversation_type == "personal":
         return DecisionResult(
             action="digest",
             message_type=infer_type(ctx, effective_text, action="digest"),
             reason="No strong urgency or risk signal; personal message defaulted to digest.",
             confidence=0.6,
+            rule_id="personal_default",
         )
 
     return DecisionResult(
@@ -904,6 +952,7 @@ def decide(
         message_type=infer_type(ctx, effective_text, action="digest"),
         reason="No strong signal either way; defaulting to digest based on conversation context.",
         confidence=0.6,
+        rule_id="default_heuristic",
     )
 
 # ---------------------------------------------------------------------------
@@ -917,11 +966,11 @@ def route_message(row: pd.Series, idx: Dict[str, Any]) -> Dict[str, Any]:
 
     safety = evaluate_safety(ctx, effective_text)
     urgency = evaluate_urgency(ctx, effective_text)
-    personalization = evaluate_personalization(ctx, idx)          # <-- now takes idx
+    personalization = evaluate_personalization(ctx, idx)
     trust = evaluate_business_trust(ctx)
 
     decision = decide(ctx, effective_text, safety, urgency, personalization, trust)
-    evidence = select_evidence(personalization, decision.action)  # <-- new signature
+    evidence = select_evidence(personalization, decision.action, decision.rule_id)
 
     return {
         "message_id": ctx.message_id,
